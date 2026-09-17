@@ -3,152 +3,195 @@ import os
 import time
 
 import requests
+from tqdm import tqdm
 
 import config
+from spotify_client import get_artist_genres
 
 # ---------------------------------------------------------------------------
-# Layer 1: raw tag -> master genre
+# This module's job: for every track, build a weighted {tag: weight} dict
+# combining four signals:
 #
-# The vocabulary of raw tags that actually shows up in your library is small
-# (a few hundred unique strings at most), so this is a lookup table you build
-# up once and cache to disk — never re-classified for a tag you've already
-# seen. Anything the keyword rules below don't catch lands in "Other"; check
-# genre_map.json after a run and either add a keyword rule here or hand-edit
-# that one entry directly.
+#   1. Last.fm track tags       — most specific, per-song
+#   2. Last.fm artist tags      — per-artist, cached
+#   3. Spotify artist genres    — per-artist, cached
+#   4. MusicBrainz artist genres — per-artist, cached
+#
+# clustering.py turns these dicts into vectors and runs clustering on them —
+# this file never buckets anything itself, it just gathers and weights tags.
+#
+# Sources 2-4 are all per-artist, so they're cached to disk
+# (config.TAG_CACHE_FILE) once computed. A library of ~1,000 tracks might
+# only have 200-400 distinct artists, and on later incremental runs almost
+# all of those artists are already cached — only genuinely new artists pay
+# the MusicBrainz/Spotify lookup cost again.
 # ---------------------------------------------------------------------------
-GENRE_KEYWORDS = [
-    # more specific terms first — first match wins
-    ("metalcore", "Metal"), ("deathcore", "Metal"), ("metal", "Metal"),
-    ("hip hop", "Hip-Hop/Rap"), ("rap", "Hip-Hop/Rap"), ("trap", "Hip-Hop/Rap"),
-    ("r&b", "R&B/Soul"), ("soul", "R&B/Soul"),
-    ("punk", "Punk"),
-    ("techno", "Electronic"), ("house", "Electronic"), ("edm", "Electronic"),
-    ("dubstep", "Electronic"), ("electro", "Electronic"), ("synth", "Electronic"),
-    ("indie", "Indie/Alternative"), ("alternative", "Indie/Alternative"),
-    ("rock", "Rock"),
-    ("pop", "Pop"),
-    ("country", "Country"),
-    ("jazz", "Jazz"),
-    ("classical", "Classical"), ("orchestra", "Classical"),
-    ("folk", "Folk"),
-    ("reggaeton", "Latin"), ("latin", "Latin"),
-    ("reggae", "Reggae"),
-    ("blues", "Blues"),
-]
-
-# Last.fm tags that are moods/decades/meta-noise rather than genres — skip
-# these when picking a track's "best" tag.
-TAG_BLOCKLIST = {
-    "seen live", "favorites", "favourite", "beautiful", "awesome", "love",
-    "2020s", "2010s", "2000s", "1990s", "1980s", "chill", "sad", "happy",
-    "female vocalists", "male vocalists", "under 2000 listeners",
-}
 
 
-def classify_genre(raw_genre):
-    g = raw_genre.lower()
-    for keyword, master in GENRE_KEYWORDS:
-        if keyword in g:
-            return master
-    return "Other"
+def _clean(tag):
+    tag = tag.lower().strip()
+    return tag if tag and tag not in config.TAG_BLOCKLIST else None
 
 
-def load_genre_map():
-    if os.path.exists(config.GENRE_MAP_FILE):
-        with open(config.GENRE_MAP_FILE) as f:
+def load_tag_cache():
+    if os.path.exists(config.TAG_CACHE_FILE):
+        with open(config.TAG_CACHE_FILE) as f:
             return json.load(f)
     return {}
 
 
-def save_genre_map(genre_map):
-    with open(config.GENRE_MAP_FILE, "w") as f:
-        json.dump(genre_map, f, indent=2)
-
-
-def get_master_genre(raw_genre, genre_map):
-    if raw_genre not in genre_map:
-        genre_map[raw_genre] = classify_genre(raw_genre)
-    return genre_map[raw_genre]
+def save_tag_cache(cache):
+    with open(config.TAG_CACHE_FILE, "w") as f:
+        json.dump(cache, f, indent=2)
 
 
 # ---------------------------------------------------------------------------
-# Layer 0: fetch a raw genre-ish tag per track from Last.fm
-#
-# Free API key, no OAuth. Matches by artist + track name, which you already
-# have from get_playlist_tracks(). Falls back to the artist's top tag if the
-# specific track has no tags of its own.
-#
-# Swap-in note: if you'd rather pay for a single authoritative genre label
-# per track instead of a crowd-tagged one, SoundStat (soundstat.info) takes a
-# Spotify track ID and returns a clean `genre` field directly — replace
-# get_top_tag()/get_artist_top_tag() with a call to that API and skip the
-# blocklist/fallback logic entirely, since there's only one tag to pick.
+# Last.fm
 # ---------------------------------------------------------------------------
-def _first_valid_tag(tags):
-    for tag in tags:
-        name = tag.get("name", "").lower().strip()
-        if name and name not in TAG_BLOCKLIST:
-            return name
-    return None
-
-
-def get_top_tag(track_name, artist_name):
+def _lastfm_top_tags(params):
     if not config.LASTFM_API_KEY:
-        return None
-    params = {
-        "method": "track.getTopTags",
-        "artist": artist_name,
-        "track": track_name,
-        "api_key": config.LASTFM_API_KEY,
-        "format": "json",
-        "autocorrect": 1,
-    }
+        return []
+    params = {**params, "api_key": config.LASTFM_API_KEY, "format": "json", "autocorrect": 1}
     try:
         resp = requests.get(config.LASTFM_API_URL, params=params, timeout=10)
         resp.raise_for_status()
-        tags = resp.json().get("toptags", {}).get("tag", [])
-        return _first_valid_tag(tags)
+        return resp.json().get("toptags", {}).get("tag", [])
     except requests.RequestException:
-        return None
+        return []
 
 
-def get_artist_top_tag(artist_name):
-    if not config.LASTFM_API_KEY:
-        return None
-    params = {
-        "method": "artist.getTopTags",
-        "artist": artist_name,
-        "api_key": config.LASTFM_API_KEY,
-        "format": "json",
-        "autocorrect": 1,
-    }
+def _weighted_tags(raw_tags, limit, weight):
+    out = {}
+    for tag in raw_tags:
+        name = _clean(tag.get("name", ""))
+        if not name:
+            continue
+        count = tag.get("count", 0)  # Last.fm counts are already 0-100 relative weights
+        out[name] = (count / 100) * weight
+        if len(out) >= limit:
+            break
+    return out
+
+
+def lastfm_track_tags(track_name, artist_name):
+    raw = _lastfm_top_tags({"method": "track.getTopTags", "artist": artist_name, "track": track_name})
+    return _weighted_tags(raw, config.LASTFM_TRACK_TAG_LIMIT, config.LASTFM_TRACK_TAG_WEIGHT)
+
+
+def lastfm_artist_tags(artist_name):
+    raw = _lastfm_top_tags({"method": "artist.getTopTags", "artist": artist_name})
+    return _weighted_tags(raw, config.LASTFM_ARTIST_TAG_LIMIT, config.LASTFM_ARTIST_TAG_WEIGHT)
+
+
+# ---------------------------------------------------------------------------
+# MusicBrainz — search for the artist's MBID, then look up its curated
+# genre list. Two requests per new (uncached) artist, each rate-limited.
+# ---------------------------------------------------------------------------
+def _mb_headers():
+    return {"User-Agent": config.MUSICBRAINZ_USER_AGENT}
+
+
+def _mb_wait():
+    time.sleep(config.MUSICBRAINZ_RATE_LIMIT_SECONDS)
+
+
+def _find_musicbrainz_artist_id(artist_name):
     try:
-        resp = requests.get(config.LASTFM_API_URL, params=params, timeout=10)
+        resp = requests.get(
+            f"{config.MUSICBRAINZ_API_URL}artist/",
+            params={"query": f'artist:"{artist_name}"', "fmt": "json", "limit": 1},
+            headers=_mb_headers(),
+            timeout=10,
+        )
+        _mb_wait()
         resp.raise_for_status()
-        tags = resp.json().get("toptags", {}).get("tag", [])
-        return _first_valid_tag(tags)
+        artists = resp.json().get("artists", [])
+        return artists[0]["id"] if artists else None
     except requests.RequestException:
+        _mb_wait()
         return None
 
 
-def attach_genres(df):
-    """Add raw_genre + master_genre columns to a features DataFrame."""
-    genre_map = load_genre_map()
-    artist_tag_cache = {}
-    raw_genres = []
+def musicbrainz_artist_genres(artist_name):
+    if not config.ENABLE_MUSICBRAINZ:
+        return {}
 
-    for _, row in df.iterrows():
-        tag = get_top_tag(row["name"], row["artist"])
+    mbid = _find_musicbrainz_artist_id(artist_name)
+    if not mbid:
+        return {}
 
-        if not tag:
-            if row["artist"] not in artist_tag_cache:
-                artist_tag_cache[row["artist"]] = get_artist_top_tag(row["artist"]) or "unknown"
-            tag = artist_tag_cache[row["artist"]]
+    try:
+        resp = requests.get(
+            f"{config.MUSICBRAINZ_API_URL}artist/{mbid}",
+            params={"inc": "genres", "fmt": "json"},
+            headers=_mb_headers(),
+            timeout=10,
+        )
+        _mb_wait()
+        resp.raise_for_status()
+        genres = resp.json().get("genres", [])
+    except requests.RequestException:
+        _mb_wait()
+        return {}
 
-        raw_genres.append(tag)
-        time.sleep(0.25)  # stay well under Last.fm's rate limit
+    genres = sorted(genres, key=lambda g: g.get("count", 0), reverse=True)[:config.MUSICBRAINZ_GENRE_LIMIT]
+    max_count = max((g.get("count", 0) for g in genres), default=0) or 1
 
-    df = df.assign(raw_genre=raw_genres)
-    df["master_genre"] = df["raw_genre"].apply(lambda g: get_master_genre(g, genre_map))
-    save_genre_map(genre_map)
-    return df
+    out = {}
+    for g in genres:
+        name = _clean(g.get("name", ""))
+        if name:
+            out[name] = (g.get("count", 0) / max_count) * config.MUSICBRAINZ_GENRE_WEIGHT
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Combine sources 2-4 for one artist, cached to disk by artist id (falls
+# back to name if a track has no artist id, e.g. some local/compilation
+# entries).
+# ---------------------------------------------------------------------------
+def _get_artist_tags(artist_id, artist_name, tag_cache, spotify_genres_by_artist):
+    key = artist_id or artist_name
+    if key in tag_cache:
+        return tag_cache[key]
+
+    combined = {}
+    combined.update(lastfm_artist_tags(artist_name))
+
+    if config.ENABLE_SPOTIFY_GENRES:
+        for g in spotify_genres_by_artist.get(artist_id, []):
+            name = _clean(g)
+            if name:
+                combined[name] = combined.get(name, 0) + config.SPOTIFY_GENRE_WEIGHT
+
+    if config.ENABLE_MUSICBRAINZ:
+        for tag, weight in musicbrainz_artist_genres(artist_name).items():
+            combined[tag] = combined.get(tag, 0) + weight
+
+    tag_cache[key] = combined
+    return combined
+
+
+def attach_tags(df):
+    """Add a 'tags' column (dict of {tag: weight}) to a tracks DataFrame."""
+    tag_cache = load_tag_cache()
+
+    spotify_genres_by_artist = {}
+    if config.ENABLE_SPOTIFY_GENRES:
+        artist_ids = sorted({aid for aid in df["artist_id"].dropna().unique()})
+        uncached_ids = [aid for aid in artist_ids if aid not in tag_cache]
+        if uncached_ids:
+            spotify_genres_by_artist = get_artist_genres(uncached_ids)
+
+    all_tags = []
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Gathering tags", unit="track"):
+        combined = dict(lastfm_track_tags(row["name"], row["artist"]))
+        for tag, weight in _get_artist_tags(
+            row["artist_id"], row["artist"], tag_cache, spotify_genres_by_artist
+        ).items():
+            combined[tag] = combined.get(tag, 0) + weight
+        all_tags.append(combined)
+        time.sleep(0.25)  # stay well under Last.fm's rate limit for the per-track call
+
+    save_tag_cache(tag_cache)
+    return df.assign(tags=all_tags)
